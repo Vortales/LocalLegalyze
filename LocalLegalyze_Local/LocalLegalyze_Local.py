@@ -4736,7 +4736,8 @@ def check_dependencies() -> bool:
     import importlib.util
 
     missing = [name for module, name in (("PyQt6", "PyQt6"),
-                                         ("websocket", "websocket-client"))
+                                         ("websocket", "websocket-client"),
+                                         ("fpdf", "fpdf2"))
                if importlib.util.find_spec(module) is None]
     if missing:
         message = ("Не установлены зависимости: " + ", ".join(missing) + "\n\n"

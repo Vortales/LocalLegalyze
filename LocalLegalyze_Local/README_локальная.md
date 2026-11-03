@@ -11,8 +11,9 @@
 
 ```
 LocalLegalyze_Local/
-├── LocalLegalyze_Local.py     ← ВСЯ программа: один файл, 4700 строк, 21 раздел
+├── LocalLegalyze_Local.py     ← ВСЯ программа: один файл, 4833 строк, 21 раздел
 ├── tests_local.py             ← 59 проверок: правило вложения, промты, JS, локальность
+├── show_deps.py               ← что установлено, чего не хватает, команда pip
 ├── smoke_local.py             ← дымовой тест окон (нужен экран или QT_QPA_PLATFORM=offscreen)
 ├── requirements-local.txt     ← зависимости
 ├── СБОРКА_локальная.txt       ← как собрать exe
@@ -38,6 +39,18 @@ logs/locallegalyze.log
 pip install -r requirements-local.txt
 python LocalLegalyze_Local.py
 ```
+
+Что вообще нужно установить (и что уже стоит) показывает `show_deps.py`:
+
+```bat
+python show_deps.py            :: таблица: пакет, есть/нет, версия, зачем
+python show_deps.py --pip      :: только строка для pip install
+python show_deps.py --check    :: код выхода 1, если чего-то не хватает
+```
+
+Обязательных пакетов три: `PyQt6` (окно), `websocket-client` (управление
+страницей через DevTools), `fpdf2` (промты `.txt`/`.md` → PDF). Всё остальное —
+стандартная библиотека Python, шрифт и значок лежат в папке программы.
 
 Первый запуск — три коротких шага:
 
