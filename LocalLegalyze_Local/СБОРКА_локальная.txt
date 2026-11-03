@@ -1,0 +1,95 @@
+СБОРКА ЛОКАЛЬНОЙ ВЕРСИИ (Windows, Nuitka)
+==========================================
+
+Собирается ОДИН файл — LocalLegalyze_Local.py.
+Внешних ресурсов у него нет, кроме шрифта для PDF (необязательно).
+
+
+1. ПОДГОТОВКА
+-------------
+   python -m venv .venv
+   .venv\Scripts\activate
+   pip install -r requirements-local.txt
+   pip install nuitka ordered-set zstandard
+
+
+2. ПРОВЕРКИ ПЕРЕД СБОРКОЙ (занимают секунды)
+--------------------------------------------
+   python tests_local.py            запускать БЕЗ Nuitka: 54 проверки логики
+   python smoke_local.py            проверка окон (нужен рабочий стол)
+
+   Оба должны закончиться словами «ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ».
+
+
+3. СБОРКА
+---------
+   Вариант A — один exe (рекомендуется):
+
+   python -m nuitka ^
+       --standalone ^
+       --onefile ^
+       --enable-plugin=pyqt6 ^
+       --windows-console-mode=disable ^
+       --windows-icon-from-ico=icon.ico ^
+       --include-data-file=data\DejaVuSans.ttf=data\DejaVuSans.ttf ^
+       --output-dir=build ^
+       --output-filename=LocalLegalyze.exe ^
+       --assume-yes-for-downloads ^
+       LocalLegalyze_Local.py
+
+   Вариант B — папка (запускается быстрее, проще отлаживать):
+
+   python -m nuitka ^
+       --standalone ^
+       --enable-plugin=pyqt6 ^
+       --windows-console-mode=disable ^
+       --windows-icon-from-ico=icon.ico ^
+       --include-data-file=data\DejaVuSans.ttf=data\DejaVuSans.ttf ^
+       --output-dir=build ^
+       LocalLegalyze_Local.py
+
+
+4. ЧТО ПОЛОЖИТЬ РЯДОМ С EXE
+---------------------------
+   prompts\            ваши промты (.pdf / .txt / .md)
+   icon.ico            иконка (необязательно)
+   data\DejaVuSans.ttf шрифт для кириллицы в PDF (необязательно,
+                       уже вложен через --include-data-file)
+
+   ВАЖНО: папка prompts\ — это рабочая папка промтов. Если её нет,
+   программа создаст её сама и положит туда пример.
+
+
+5. ЧЕГО В СБОРКЕ НАМЕРЕННО НЕТ
+------------------------------
+   * нет requests и urllib3 — сетевых вызовов к серверу в программе нет;
+   * нет cryptography  — паролей и шифрованных промтов с сервера больше нет
+                         (старые .enc читаются, только если cryptography
+                          уже установлена; для локальной версии не требуется);
+   * нет PyQt6-WebEngine — используется настоящий Chrome, а не встроенный движок.
+
+   Это уменьшает exe примерно на 100 МБ по сравнению с серверной сборкой.
+
+
+6. ПРОВЕРКА ПОСЛЕ СБОРКИ
+------------------------
+   [ ] Запуск без консольного окна.
+   [ ] Первый запуск: окно «Шаблон» и окно горячих клавиш.
+   [ ] Кнопка «Промт» видит файлы из prompts\.
+   [ ] В чате появляются РОВНО ДВА файла: <имя>.pdf и Шаблон.txt.
+   [ ] Через 5–10 запросов в чате по-прежнему два файла (главная проверка).
+   [ ] «Микрофон» два раза: запись, затем отправка.
+   [ ] «⟳» перезапускает браузер и снова вкладывает файлы.
+   [ ] logs\locallegalyze.log заполняется и не растёт больше ~2 МБ.
+
+
+7. ЕСЛИ СБОРКА ПАДАЕТ
+---------------------
+   --windows-console-mode=disable -> --windows-console-mode=force
+       тогда консоль останется и покажет ошибку;
+
+   антивирус может ругаться на onefile: используйте вариант B (папка).
+
+   Для диагностики конкретного шага в программе есть лог:
+   logs\locallegalyze.log рядом с exe (или в %APPDATA%\LegalyzeLocal,
+   если папка программы недоступна для записи).

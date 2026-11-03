@@ -1,0 +1,13 @@
+# Данные, создаваемые при запуске (не должны попадать в git)
+config.json
+Шаблон.txt
+Шаблон.txt.tmp
+config.json.tmp
+browser-profile/
+data/work/
+data/prompt_cache.json
+logs/
+prompts/
+*.lock
+build/
+__pycache__/
