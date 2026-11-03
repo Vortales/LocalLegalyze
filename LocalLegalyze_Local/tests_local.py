@@ -415,6 +415,209 @@ def test_js():
 
 
 # ---------------------------------------------------------------------------
+# 9. Win32-вживление: регрессии, из-за которых браузер «выходил из GUI»
+# ---------------------------------------------------------------------------
+
+def test_win32_handles():
+    """HWND из Win32 приходит как c_void_p — читать надо `.value`, а не int()."""
+    section("9. Хэндлы и вживление окна (регрессии после запуска на Windows)")
+
+    import ctypes
+    pointer = ctypes.c_void_p(0x1A2B3C4D5E)
+    check(app.handle_value(pointer) == 0x1A2B3C4D5E,
+          "handle_value(c_void_p) даёт адрес, а не 0")
+    check(app.handle_value(pointer.value) == 0x1A2B3C4D5E,
+          "handle_value(int) работает как раньше")
+    check(app.handle_value(None) == 0, "handle_value(None) = 0")
+    check(app.hwnd_of(pointer).value == 0x1A2B3C4D5E,
+          "hwnd_of(c_void_p) не превращает хэндл в 0")
+    try:
+        int(pointer)
+    except (TypeError, ValueError):
+        check(True, "int(c_void_p) действительно падает — откуда и брался 0")
+    else:
+        check(False, "int(c_void_p) не падает: проверка устарела")
+
+    check(isinstance(app.HWND_TOPMOST, ctypes.c_void_p),
+          "HWND_TOPMOST передаётся как c_void_p(-1)")
+    check(app.HWND_TOPMOST.value == 0xFFFFFFFFFFFFFFFF,
+          "HWND_TOPMOST = -1 в машинном представлении")
+
+
+def test_win32_style():
+    """Стили окна — знаковые 32 бита; WS_CHILD обязан ставиться и сниматься."""
+    def signed(value):
+        raw = value & 0xFFFFFFFF
+        return raw - 0x100000000 if raw & 0x80000000 else raw
+
+    check(signed(app.WS_POPUP) == -2147483648, "WS_POPUP = 0x80000000 приводится к LONG")
+    check(signed(app.WS_CHILD) == 0x40000000, "WS_CHILD остаётся положительным")
+    popup = signed(app.WS_POPUP)
+    children = (popup & ~(app.WS_POPUP | app.WS_CAPTION | app.WS_SYSMENU |
+                          app.WS_THICKFRAME | app.WS_MINIMIZEBOX |
+                          app.WS_MAXIMIZEBOX | app.WS_DLGFRAME | app.WS_BORDER)) \
+        | app.WS_CHILD | app.WS_VISIBLE | app.WS_CLIPCHILDREN | app.WS_CLIPSIBLINGS
+    check(children & app.WS_CHILD, "WS_CHILD добавляется к стилю")
+    check(not children & app.WS_POPUP, "WS_POPUP снимается (иначе окно остаётся отдельным)")
+    check(not children & app.WS_CAPTION, "рамка с кнопками снимается")
+
+
+def test_win32_source_invariants():
+    """Статическая проверка кода: то, что нельзя увидеть без Windows."""
+    import ast
+
+    source = Path(HERE / "LocalLegalyze_Local.py").read_text()
+    code = strip_docs_and_comments(source)
+
+    # 1. Никаких int(...) вокруг хэндлов, вернувшихся из ctypes.
+    tree = ast.parse(source)
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "int" or not node.args:
+            continue
+        argument = node.args[0]
+        if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name) \
+                and argument.func.id in ("hwnd_of", "GetParent"):
+            bad.append(node.lineno)
+    check(not bad, f"нет int() вокруг c_void_p (найдено: {len(bad)})")
+
+    check("handle_value(" in code, "преобразование хэндла идёт через handle_value()")
+    check("int(self.winId())" not in code and "int(self.placeholder.winId())" not in code,
+          "хэндлы Qt (winId) тоже идут через handle_value()")
+    check("SetWindowLongW" in code and "c_void_p(value &" not in code,
+          "стиль пишется через SetWindowLongW с LONG, а не указателем")
+    check("c_void_p(-1)" in code, "HWND_TOPMOST объявлен как указатель")
+    check("hwnd_of(hwnd), HWND_TOPMOST" in code,
+          "force_topmost передаёт настоящий HWND и HWND_TOPMOST")
+    check("SetParent" in code and "is_child_of" in code,
+          "после SetParent выполняется проверка GetParent")
+    check("while True" in code and "SetParent не прикрепил" in code,
+          "вживление повторяется, пока окно не станет дочерним")
+    check("detach_window" in code, "неудачное вживление откатывается")
+    check("hide_from_taskbar" in code and "_COM_SLOT_DELETE_TAB" in code,
+          "кнопка браузера убирается из панели задач через DeleteTab")
+    check("ReadProcessMemory" in code, "таблица методов COM читается безопасно")
+    check("def poll_focus" in code and "AttachThreadInput" in code,
+          "фокус клавиатуры передаётся в чат по клику")
+    check("def moveEvent" in code, "у главного окна есть moveEvent")
+    check("self.overlay.sync_geometry()" in code,
+          "шторка пересчитывает положение вместе с окном")
+    check("is_child_of(self.hwnd, parent)" in code,
+          "хост замечает отрыв окна браузера и вживляет заново")
+    check("focus_timer" in code, "есть таймер передачи фокуса")
+
+
+def test_window_choice():
+    """Вживлять нужно ОКНО СТРАНИЦЫ, а не служебное окно браузера."""
+    section("10. Какое окно вживлять")
+
+    windows = [
+        {"hwnd": 1, "class": "Chrome_WidgetWin_0", "visible": True, "parent": 0,
+         "rect": (0, 0, 520, 300), "area": 520 * 300, "owner": 0, "self_root": True},
+        {"hwnd": 2, "class": "Chrome_WidgetWin_1", "visible": True, "parent": 0,
+         "rect": (0, 0, 453, 735), "area": 453 * 735, "owner": 0, "self_root": True},
+        {"hwnd": 3, "class": "Chrome_WidgetWin_1", "visible": True, "parent": 0,
+         "rect": (0, 0, 300, 200), "area": 300 * 200, "owner": 0, "self_root": True},
+    ]
+    top = [w for w in windows if w["visible"] and not w["parent"]]
+    eligible = [w for w in top if w["class"] == app.BROWSER_WINDOW_CLASS] or top
+    best = max(eligible, key=lambda w: w["area"])
+    check(best["hwnd"] == 2, "выбирается окно страницы (Chrome_WidgetWin_1), а не служебное")
+    check(best["class"] == "Chrome_WidgetWin_1", "класс выбранного окна — окно приложения")
+
+    source = Path(HERE / "LocalLegalyze_Local.py").read_text()
+    check('"class"] != BROWSER_WINDOW_CLASS' in source,
+          "поиск окна страницы фильтрует по классу")
+    check("_wait_for_page" in source,
+          "вживление ждёт, пока ссылка --app= станет настоящей страницей")
+    check('window.get("class") == BROWSER_WINDOW_CLASS' in source,
+          "WM_CLOSE посылается только окну приложения")
+    check('if window.get("parent") and not window.get("self_root")' in source,
+          "вложенные служебные окна не закрываются")
+
+
+def test_layout_contract():
+    """Шторка обязана геометрически совпадать с областью чата (без запуска GUI)."""
+    section("11. Раскладка: шторка и область чата")
+
+    class FakeRect:
+        def __init__(self, x, y, w, h):
+            self._x, self._y, self._w, self._h = x, y, w, h
+
+        def x(self):
+            return self._x
+
+        def y(self):
+            return self._y
+
+        def width(self):
+            return self._w
+
+        def height(self):
+            return self._h
+
+    class FakeOwner:
+        top_inset = 54
+        bottom_inset = 30
+
+        def frameGeometry(self):
+            return FakeRect(1426, 200, 453, 735)
+
+    # Повторяем ровно ту формулу, что в LoadingOverlay.sync_geometry.
+    geometry = FakeOwner().frameGeometry()
+    top, bottom = FakeOwner.top_inset, FakeOwner.bottom_inset
+    box = (geometry.x(), geometry.y() + top, geometry.width(),
+           geometry.height() - top - bottom)
+    check(box == (1426, 254, 453, 651), f"шторка = область чата: {box}")
+    check(box[1] == 200 + 54, "верх шторки = верх окна + верхняя панель")
+    check(box[3] == 735 - 54 - 30, "низ шторки = низ окна − нижняя панель")
+
+    # Сдвинули окно на +120/+75 — шторка обязана сдвинуться ровно так же.
+    moved = (box[0] + 120, box[1] + 75, box[2], box[3])
+    check(moved == (1546, 329, 453, 651), f"шторка едет вместе с окном: {moved}")
+
+    source = Path(HERE / "LocalLegalyze_Local.py").read_text()
+    check("frameGeometry()" in source,
+          "положение берётся у рамки окна (иначе шторка уезжает на толщину рамки)")
+    check("def moveEvent" in source, "moveEvent пересчитывает шторку")
+    check(source.count("self._place_overlay()") >= 3,
+          "шторка ставится на место из показа, смены состояния и таймера")
+    check("focus_timer.start(25)" in source, "опрос фокуса идёт с шагом 25 мс")
+
+
+def test_embed_retry_logic():
+    """Повтор SetParent: пока GetParent не подтвердил, попытки продолжаются."""
+    state = {"parent": 0, "calls": 0}
+
+    def fake_embed(ok_on_call):
+        for _attempt in range(6):
+            state["calls"] += 1
+            if state["calls"] >= ok_on_call:
+                state["parent"] = 777
+                return True
+        return False
+
+    check(fake_embed(3), "вживление удаётся с 3-й попытки")
+    check(state["calls"] == 3, "попыток ровно 3 — лишних нет")
+    check(state["parent"] == 777, "GetParent подтверждает нужного родителя")
+
+
+# ---------------------------------------------------------------------------
+
+def test_report():
+    """Короткая справка по журналу: что искать, если снова «уедет»."""
+    section("12. Подсказка на случай повторения")
+    print("  Если браузер снова окажется отдельным окном — в журнале ищите строки:")
+    print("    «окно браузера встроено»      — вживление удалось (есть номер попытки)")
+    print("    «окно браузера выпало»        — окно оторвалось, программа его вернула")
+    print("    «окно перемещено»             — координаты окна на экране")
+    print("    «область чата: ... DIP»       — размеры и масштаб (сдвиг браузера)")
+    print("    «масштаб экрана»              — сменился монитор/масштаб Windows")
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     print("Проверки LocalLegalyze (локальная версия)")
@@ -425,7 +628,14 @@ def main() -> int:
     test_names()
     test_prompt_store()
     test_no_network()
+    test_win32_handles()
+    test_win32_style()
+    test_win32_source_invariants()
+    test_window_choice()
+    test_layout_contract()
+    test_embed_retry_logic()
     test_js()
+    test_report()
 
     print("\n" + "=" * 60)
     if FAILURES:

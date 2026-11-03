@@ -12,7 +12,11 @@ smoke_local.py — проверка «всё собрано и связано» 
   * кнопки подключены к своим обработчикам;
   * локальный шаблон и конфиг читаются/пишутся;
   * склад промтов отдаёт PDF;
-  * выход по «✕» не оставляет потоков.
+  * выход по «✕» не оставляет потоков;
+  * шторка ожидания стоит РОВНО над областью чата и едет вместе с окном
+    (это и проверялось на живом запуске: «окно ожидания слева от GUI»);
+  * окно программы остаётся поверх остальных (frameless + topmost);
+  * таймер передачи фокуса взведён, браузер не запускается вообще.
 
 Браузер НЕ запускается: проверяется только собственная часть приложения.
 """
@@ -127,6 +131,60 @@ def main() -> int:
     check(abs(dsf - 0.667) < 0.01, f"dsf ≈ 0.667 (получено {dsf:.3f})")
     inset = window._browser_inset()
     check(inset == (0, 0, 0, 0), "по умолчанию окно браузера занимает область целиком")
+
+    # ------------------------------------------------- шторка ожидания
+    print("\n=== Шторка ожидания (её видели слева от окна) ===")
+    window._show_overlay("Проверка", "Проверяем положение шторки…")
+    application.processEvents()
+
+    overlay = window.overlay
+    check(overlay.isVisible(), "шторка показана")
+    area = window.browser_placeholder
+    origin = area.mapToGlobal(area.rect().topLeft())
+    check((overlay.x(), overlay.y()) == (origin.x(), origin.y()),
+          f"шторка стоит ровно над областью чата "
+          f"({overlay.x()},{overlay.y()} против {origin.x()},{origin.y()})")
+    check((overlay.width(), overlay.height()) == (area.width(), area.height()),
+          f"шторка того же размера, что область чата "
+          f"({overlay.width()}x{overlay.height()} против {area.width()}x{area.height()})")
+
+    # Переезд окна: рамка обещала, что шторка поедет за ним.
+    before = (overlay.x(), overlay.y())
+    window.move(window.x() + 120, window.y() + 75)
+    application.processEvents()
+    expected_origin = area.mapToGlobal(area.rect().topLeft())
+    check((overlay.x(), overlay.y()) == (expected_origin.x(), expected_origin.y()),
+          "после переезда окна шторка на новом месте (она не осталась слева)")
+    check((overlay.x(), overlay.y()) != before, "координаты шторки действительно изменились")
+    check((overlay.width(), overlay.height()) == (area.width(), area.height()),
+          "после переезда размер шторки по-прежнему совпадает с областью чата")
+
+    # Ручной сдвиг шторки не должен «залипать»: синхронизация возвращает её на место.
+    overlay.move(overlay.x() - 300, overlay.y() - 200)
+    window._place_overlay()
+    application.processEvents()
+    fixed_origin = area.mapToGlobal(area.rect().topLeft())
+    check((overlay.x(), overlay.y()) == (fixed_origin.x(), fixed_origin.y()),
+          "шторку можно вернуть на место одним вызовом _place_overlay()")
+
+    # Свёрнутое окно не должно оставлять шторку висеть на экране.
+    window.showMinimized()
+    application.processEvents()
+    check(not overlay.isVisible(), "при сворачивании окна шторка скрывается")
+    window.showNormal()
+    application.processEvents()
+
+    check(window.focus_timer.isActive(), "таймер передачи фокуса в чат взведён")
+    check(window.topmost_timer.isActive(), "таймер удержания окна поверх взведён")
+    flags = window.windowFlags()
+    from PyQt6.QtCore import Qt as _Qt
+    check(bool(flags & _Qt.WindowType.FramelessWindowHint),
+          "у окна нет системной рамки (кнопки свернуть/закрыть не показываются)")
+    check(bool(flags & _Qt.WindowType.WindowStaysOnTopHint), "окно поверх остальных")
+
+    window._hide_overlay()
+    application.processEvents()
+    check(not overlay.isVisible(), "шторка убирается после готовности")
 
     # ---------------------------------------------------------- закрытие
     print("\n=== Закрытие ===")

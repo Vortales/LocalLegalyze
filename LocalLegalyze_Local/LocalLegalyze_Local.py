@@ -197,6 +197,12 @@ QPushButton#Ghost:hover {{ color: {THEME['text']}; border-color: {THEME['accent'
 # 3. ЛОГ. Один текстовый файл, запись пачками, без нагрузки на GUI.
 # =============================================================================
 
+#: Позиция главного окна на экране. По журналу сразу видно, сдвигали ли окно:
+#: если оно стоит на месте, а шторка «уехала» — дело не в moveEvent, а если
+#: обе координаты менялись вместе — шторка просто не успевает за окном.
+_WINDOW_POSITION: dict[str, int] = {}
+
+
 class Log:
     """Потокобезопасный лог с буфером: диск не тормозит ни GUI, ни страницу.
 
@@ -304,7 +310,11 @@ SW_SHOW = 5
 SW_HIDE = 0
 
 TH32CS_SNAPPROCESS = 0x00000002
-HWND_TOPMOST = -1
+#: HWND_TOPMOST — не «минус единица», а указатель на -1: ctypes требует
+#: c_void_p(-1). Раньше здесь стояло `int(hwnd)` в SetWindowPos, то есть
+#: вместо HWND в функцию уезжало 0 — окно не поднималось.
+HWND_TOPMOST = ctypes.c_void_p(-1)
+HWND_TOP = 0
 
 user32 = ctypes.WinDLL("user32", use_last_error=True) if IS_WINDOWS else None
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if IS_WINDOWS else None
@@ -319,6 +329,14 @@ class RECT(ctypes.Structure):
                 ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
 
 
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                ("rcCaret", RECT)]
+
+
 class PROCESSENTRY32W(ctypes.Structure):
     _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
                 ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
@@ -327,7 +345,7 @@ class PROCESSENTRY32W(ctypes.Structure):
                 ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
 
 
-def _declare_win32() -> None:
+def _declare_win32() -> None:  # noqa: C901 - один список прототипов, так виднее
     """Явные прототипы Win32: HWND — это указатель, а не int.
 
     Без `argtypes` ctypes выводит тип из значения и на 64-битном Python
@@ -342,6 +360,7 @@ def _declare_win32() -> None:
                           ctypes.c_int, uint], wintypes.BOOL),
         "SetParent": ([ptr, ptr], ptr),
         "GetParent": ([ptr], ptr),
+        "GetWindow": ([ptr, uint], ptr),
         "ShowWindow": ([ptr, ctypes.c_int], wintypes.BOOL),
         "GetWindowRect": ([ptr, ctypes.POINTER(RECT)], wintypes.BOOL),
         "GetClientRect": ([ptr, ctypes.POINTER(RECT)], wintypes.BOOL),
@@ -349,6 +368,17 @@ def _declare_win32() -> None:
         "SetWindowLongPtrW": ([ptr, ctypes.c_int, ctypes.c_void_p], ctypes.c_void_p),
         "GetWindowLongW": ([ptr, ctypes.c_int], long_),
         "SetWindowLongW": ([ptr, ctypes.c_int, long_], long_),
+        # Нужно для focus-перехода между процессами (см. browser_focus).
+        "GetForegroundWindow": ([], ptr),
+        "SetFocus": ([ptr], ptr),
+        "GetFocus": ([], ptr),
+        "IsChild": ([ptr, ptr], wintypes.BOOL),
+        "GetCursorPos": ([ctypes.POINTER(wintypes.POINT)], wintypes.BOOL),
+        "WindowFromPoint": ([wintypes.POINT], ptr),
+        "AttachThreadInput": ([wintypes.DWORD, wintypes.DWORD, wintypes.BOOL], wintypes.BOOL),
+        "GetGUIThreadInfo": ([wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)], wintypes.BOOL),
+        "GetAncestor": ([ptr, uint], ptr),
+        "EnumChildWindows": ([ptr, ctypes.c_void_p, wintypes.LPARAM], wintypes.BOOL),
         "GetWindowThreadProcessId": ([ptr, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
         "IsWindow": ([ptr], wintypes.BOOL),
         "IsWindowVisible": ([ptr], wintypes.BOOL),
@@ -377,12 +407,29 @@ def _declare_win32() -> None:
         pass
 
 
-def hwnd_of(value) -> ctypes.c_void_p:
-    """Преобразовать HWND (int/sip.voidptr) в указатель для ctypes."""
+def handle_value(value) -> int:
+    """HWND/HANDLE → обычное число.
+
+    Здесь была КОРНЕВАЯ ошибка всей вживляющей части: `int(c_void_p(1234))`
+    в Python НЕ даёт 1234 — ctypes пытается разобрать сырые байты как текст и
+    падает с ValueError. `int()` внутри `try/except` это глотал, и ЛЮБОЙ
+    хэндл, вернувшийся из Win32 как c_void_p, превращался в 0.
+    Читать надо `.value` — только он и есть адрес.
+    """
+    if value is None:
+        return 0
+    raw = getattr(value, "value", value)
+    if raw is None:
+        return 0
     try:
-        return ctypes.c_void_p(int(value or 0))
-    except Exception:
-        return ctypes.c_void_p(0)
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def hwnd_of(value) -> ctypes.c_void_p:
+    """Преобразовать HWND (int/c_void_p/sip.voidptr) в указатель для ctypes."""
+    return ctypes.c_void_p(handle_value(value))
 
 
 def _clear_error() -> None:
@@ -406,48 +453,103 @@ def _last_error() -> int:
 
 
 def get_window_long(hwnd: int, index: int) -> int:
-    if not user32:
+    """Прочитать стиль окна. Возвращает ЗНАКОВОЕ 32-битное число, как Win32."""
+    if not user32 or not hwnd:
         return 0
     getter = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
     _clear_error()
-    value = getter(hwnd, index)
-    return int(value) & 0xFFFFFFFFFFFFFFFF if value else 0
+    try:
+        value = getter(hwnd_of(hwnd), index)
+    except Exception:
+        Log.exc("win.get_window_long")
+        return 0
+    raw = handle_value(value)
+    # 0xFFFFFFFF для младших 32 бит: стили — это LONG, и старшие биты после
+    # GetWindowLongPtrW приходят нулями только на 64-битном Python.
+    raw &= 0xFFFFFFFF
+    return raw - 0x100000000 if raw & 0x80000000 else raw
 
 
 def set_window_long(hwnd: int, index: int, value: int) -> int:
-    if not user32:
+    """Записать стиль окна.
+
+    Для GWL_STYLE/GWL_EXSTYLE у Win32 есть ровно `SetWindowLongW` с аргументом
+    LONG (4 байта). `SetWindowLongPtrW` с `c_void_p` здесь НЕЛЬЗЯ: для этих
+    индексов функция копирует только младшие 32 бита, а передача указателя
+    на некоторых сборках Windows возвращает ERROR_INVALID_PARAMETER.
+    """
+    if not user32 or not hwnd:
         return 0
-    setter = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+    signed = value & 0xFFFFFFFF
+    if signed & 0x80000000:
+        signed -= 0x100000000
     _clear_error()
-    previous = setter(hwnd, index, ctypes.c_void_p(value & 0xFFFFFFFFFFFFFFFF))
+    try:
+        previous = user32.SetWindowLongW(hwnd_of(hwnd), index, signed)
+    except Exception:
+        Log.exc("win.set_window_long")
+        return 0
     if not previous and _last_error():
-        raise OSError(_last_error(), "SetWindowLong failed")
-    return int(previous) & 0xFFFFFFFFFFFFFFFF if previous else 0
+        raise OSError(_last_error(), "SetWindowLongW failed")
+    raw = handle_value(previous) & 0xFFFFFFFF
+    return raw - 0x100000000 if raw & 0x80000000 else raw
+
+
+def raise_window(hwnd: int) -> bool:
+    """Поднять окно наверх ВНУТРИ родителя (HWND_TOP).
+
+    Дочернее окно браузера после SetParent встаёт поверх соседей, поэтому
+    одной шторки Qt недостаточно — её нужно поднимать настоящим HWND_TOP.
+    """
+    if not user32 or not hwnd:
+        return False
+    try:
+        return bool(user32.SetWindowPos(hwnd_of(hwnd), hwnd_of(HWND_TOP), 0, 0, 0, 0,
+                                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE))
+    except Exception:
+        Log.exc("win.raise_window")
+        return False
 
 
 def client_size(hwnd: int) -> tuple[int, int]:
+    """Размер КЛИЕНТСКОЙ части окна (без рамки) — в нём живут дочерние окна."""
     if not user32 or not hwnd:
         return (0, 0)
     rect = RECT()
-    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+    try:
+        if not user32.GetClientRect(hwnd_of(hwnd), ctypes.byref(rect)):
+            return (0, 0)
+    except Exception:
+        Log.exc("win.client_size")
         return (0, 0)
-    return (rect.right - rect.left, rect.bottom - rect.top)
+    return (int(rect.right - rect.left), int(rect.bottom - rect.top))
 
 
 def window_rect(hwnd: int) -> tuple[int, int, int, int]:
     if not user32 or not hwnd:
         return (0, 0, 0, 0)
     rect = RECT()
-    user32.GetWindowRect(hwnd, ctypes.byref(rect))
-    return (rect.left, rect.top, rect.right, rect.bottom)
+    try:
+        if not user32.GetWindowRect(hwnd_of(hwnd), ctypes.byref(rect)):
+            return (0, 0, 0, 0)
+    except Exception:
+        Log.exc("win.window_rect")
+        return (0, 0, 0, 0)
+    return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
 
 
 def force_topmost(hwnd: int) -> bool:
-    """Поднять окно поверх остальных (у приложения нет рамки)."""
+    """Поднять окно поверх остальных (у приложения нет рамки).
+
+    ЗДЕСЬ БЫЛА ВТОРАЯ ОШИБКА: `SetWindowPos(int(hwnd), HWND_TOPMOST, ...)`.
+    Первый аргумент объявлен как c_void_p — проходил, а вот HWND_TOPMOST был
+    числом -1 вместо `c_void_p(-1)`: ctypes не мог его сконвертировать, вызов
+    не выполнялся, и окно никогда не поднималось наверх.
+    """
     if not user32 or not hwnd:
         return False
     try:
-        return bool(user32.SetWindowPos(int(hwnd), HWND_TOPMOST, 0, 0, 0, 0,
+        return bool(user32.SetWindowPos(hwnd_of(hwnd), HWND_TOPMOST, 0, 0, 0, 0,
                                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE))
     except Exception:
         Log.exc("win.force_topmost")
@@ -461,11 +563,185 @@ def apply_taskbar_style(hwnd: int) -> None:
     try:
         style = get_window_long(hwnd, GWL_EXSTYLE)
         set_window_long(hwnd, GWL_EXSTYLE, (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
-        user32.SetWindowPos(int(hwnd), 0, 0, 0, 0, 0,
+        user32.SetWindowPos(hwnd_of(hwnd), None, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                             SWP_NOACTIVATE | SWP_FRAMECHANGED)
     except Exception:
         Log.exc("win.taskbar_style")
+
+
+# ---------------------------------------------------------------------------
+# ПАНЕЛЬ ЗАДАЧ. Стиля WS_EX_TOOLWINDOW НЕДОСТАТОЧНО: Chromium сам возвращает
+# свою кнопку через ITaskbarList::AddTab, поэтому нужен DeleteTab.
+#
+# Вызов идёт через COM, а COM-объект можно прочитать «не туда» — и тогда
+# процесс падает с access violation, который НЕ перехватывается (SEH уже не
+# работает). Поэтому: сначала БЕЗОПАСНОЕ чтение таблицы методов через
+# ReadProcessMemory своего же процесса, при первом сомнении COM выключается
+# до конца работы программы.
+# ---------------------------------------------------------------------------
+
+CLSID_TASKBAR_LIST = "{56FDF344-FD6D-11D0-958A-006097C9A090}"
+IID_ITASKBAR_LIST = "{56FDF342-FD6D-11D0-958A-006097C9A090}"
+CLSCTX_ALL = 0x0017
+_COM_SLOT_HR_INIT = 3
+_COM_SLOT_DELETE_TAB = 5
+_COM_SLOT_RELEASE = 2
+_COM_SLOTS = 8
+
+#: True после первой же осечки — дальше COM в этом процессе не трогаем.
+_COM_DISABLED = False
+_OLE32 = None
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(text: str) -> GUID:
+    raw = str(text).strip("{}").split("-")
+    value = GUID()
+    value.Data1 = int(raw[0], 16)
+    value.Data2 = int(raw[1], 16)
+    value.Data3 = int(raw[2], 16)
+    value.Data4 = (ctypes.c_ubyte * 8)(*bytes.fromhex(raw[3] + raw[4]))
+    return value
+
+
+def ole32():
+    """ole32 с прототипами (без comtypes и pywin32)."""
+    global _OLE32, _COM_DISABLED
+    if _COM_DISABLED or not IS_WINDOWS:
+        return None
+    if _OLE32 is not None:
+        return _OLE32
+    try:
+        dll = ctypes.WinDLL("ole32", use_last_error=True)
+        dll.CoInitialize.argtypes = [ctypes.c_void_p]
+        dll.CoInitialize.restype = ctypes.c_long
+        dll.CoCreateInstance.argtypes = [ctypes.POINTER(GUID), ctypes.c_void_p,
+                                         wintypes.DWORD, ctypes.POINTER(GUID),
+                                         ctypes.POINTER(ctypes.c_void_p)]
+        dll.CoCreateInstance.restype = ctypes.c_long
+        _OLE32 = dll
+        return dll
+    except Exception:
+        _COM_DISABLED = True
+        Log.exc("win.ole32")
+        return None
+
+
+def read_pointer(address: int) -> int | None:
+    """Прочитать указатель БЕЗ разыменования из Python.
+
+    `table[slot]` — это обращение к чужой памяти из Python: если адрес плохой,
+    процесс просто умирает. `ReadProcessMemory` по своему же процессу вместо
+    этого честно возвращает «не удалось».
+    """
+    if not kernel32 or not address:
+        return None
+    buffer = ctypes.c_void_p()
+    read = ctypes.c_size_t(0)
+    size = ctypes.sizeof(ctypes.c_void_p)
+    try:
+        ok = kernel32.ReadProcessMemory(kernel32.GetCurrentProcess(),
+                                        ctypes.c_void_p(int(address)),
+                                        ctypes.byref(buffer), size,
+                                        ctypes.byref(read))
+    except Exception:
+        return None
+    if not ok or int(read.value or 0) != size:
+        return None
+    return int(buffer.value or 0)
+
+
+def com_vtable(interface: int, slots: int = _COM_SLOTS) -> list[int] | None:
+    """Первые `slots` адресов таблицы методов. None — читать нельзя."""
+    if not interface:
+        return None
+    table = read_pointer(interface)
+    if not table:
+        return None
+    size = ctypes.sizeof(ctypes.c_void_p)
+    result = []
+    for index in range(int(slots)):
+        address = read_pointer(table + index * size)
+        if not address:
+            return None
+        result.append(address)
+    # У живого COM-объекта слоты разные: совпадение означает мусор.
+    if len(set(result)) != len(result):
+        return None
+    return result
+
+
+def com_call(interface: int, slot: int, *args) -> int | None:
+    """Вызвать метод COM-объекта. Вне Windows и при сомнениях — None."""
+    global _COM_DISABLED
+    if _COM_DISABLED or not interface or not IS_WINDOWS:
+        return None
+    slots = com_vtable(interface)
+    if not slots or int(slot) >= len(slots):
+        return None
+    address = int(slots[int(slot)] or 0)
+    if not address:
+        return None
+    try:
+        proto = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p,
+                                   *([wintypes.HWND] * len(args)))
+        hr = int(proto(address)(ctypes.c_void_p(int(interface)), *args))
+        return hr
+    except OSError:
+        _COM_DISABLED = True
+        Log.exc("win.com_call")
+        return None
+    except Exception:
+        return None
+
+
+def hide_from_taskbar(hwnd: int) -> bool:
+    """Убрать кнопку окна из панели задач: стиль + ITaskbarList::DeleteTab."""
+    global _COM_DISABLED
+    if not user32 or not hwnd:
+        return False
+    apply_taskbar_style(hwnd)
+    if _COM_DISABLED:
+        return True
+    dll = ole32()
+    if dll is None:
+        return True
+    pointer = ctypes.c_void_p()
+    try:
+        try:
+            dll.CoInitialize(None)
+        except Exception:
+            pass
+        hr = int(dll.CoCreateInstance(ctypes.byref(_guid(CLSID_TASKBAR_LIST)), None,
+                                      CLSCTX_ALL,
+                                      ctypes.byref(_guid(IID_ITASKBAR_LIST)),
+                                      ctypes.byref(pointer)))
+        if hr < 0 or not pointer.value:
+            return True
+        interface = int(pointer.value)
+        if com_vtable(interface) is None:
+            _COM_DISABLED = True
+            Log.warn("COM панели задач недоступен — окно убираем только стилем")
+            return True
+        init = com_call(interface, _COM_SLOT_HR_INIT)
+        if init is None or init < 0:
+            return True
+        deleted = com_call(interface, _COM_SLOT_DELETE_TAB, hwnd_of(hwnd))
+        return bool(deleted is not None and int(deleted) >= 0)
+    except Exception:
+        Log.exc("win.taskbar")
+        return False
+    finally:
+        if pointer.value:
+            try:
+                com_call(int(pointer.value), _COM_SLOT_RELEASE)
+            except Exception:
+                pass
 
 
 def process_names() -> dict[int, str]:
@@ -557,7 +833,32 @@ def kill_tree(roots) -> None:
             continue
 
 
+def _declare_kernel32() -> None:
+    """Прототипы для снимков процессов и безопасного чтения указателей."""
+    if not kernel32:
+        return
+    decl = {
+        "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], ctypes.c_void_p),
+        "CloseHandle": ([ctypes.c_void_p], wintypes.BOOL),
+        "GetCurrentProcess": ([], ctypes.c_void_p),
+        "GetCurrentThreadId": ([], wintypes.DWORD),
+        "ReadProcessMemory": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)],
+                              wintypes.BOOL),
+    }
+    for name, (args, restype) in decl.items():
+        try:
+            function = getattr(kernel32, name, None)
+            if function is None:
+                continue
+            function.argtypes = args
+            function.restype = restype
+        except Exception:
+            continue
+
+
 _declare_win32()
+_declare_kernel32()
 
 
 # =============================================================================
@@ -2019,11 +2320,15 @@ def _windows_of(pids: set[int]) -> list[dict]:
             if not name.startswith("Chrome_WidgetWin"):
                 return True
             left, top, right, bottom = window_rect(hwnd)
+            handle = handle_value(hwnd)
             found.append({
-                "hwnd": int(hwnd),
+                "hwnd": handle,
                 "class": name,
                 "visible": bool(user32.IsWindowVisible(hwnd_of(hwnd))),
-                "parent": int(user32.GetParent(hwnd_of(hwnd)) or 0),
+                "parent": handle_value(user32.GetParent(hwnd_of(hwnd))),
+                "owner": handle_value(user32.GetWindow(hwnd_of(hwnd), GW_OWNER)),
+                "self_root": handle_value(user32.GetAncestor(hwnd_of(hwnd),
+                                                             GA_ROOTOWNER)) == handle,
                 "rect": (left, top, right, bottom),
                 "area": max(0, right - left) * max(0, bottom - top),
             })
@@ -2036,14 +2341,20 @@ def _windows_of(pids: set[int]) -> list[dict]:
 
 
 def find_browser_window(pids: set[int], timeout: float = 30.0) -> int:
-    """Дождаться настоящего окна приложения, а не служебного попапа."""
+    """Самое большое видимое окно браузера верхнего уровня.
+
+    Служебные окна Chromium (`Chrome_WidgetWin_0`) отбрасываются: вживить их
+    значит показать пустое окно без страницы. Если окон класса `_1` нет вовсе,
+    берём любое большое — лучше хоть какое-то окно, чем ничего.
+    """
     deadline = time.monotonic() + max(1.0, timeout)
     wanted = set(pids) | process_tree(pids)
     while time.monotonic() < deadline:
-        eligible = [w for w in _windows_of(wanted)
-                    if w["visible"] and not w["parent"]
-                    and (w["rect"][2] - w["rect"][0]) >= 120
-                    and (w["rect"][3] - w["rect"][1]) >= 120]
+        windows = [w for w in _windows_of(wanted)
+                   if w["visible"] and not w["parent"]
+                   and (w["rect"][2] - w["rect"][0]) >= 120
+                   and (w["rect"][3] - w["rect"][1]) >= 120]
+        eligible = [w for w in windows if w["class"] == BROWSER_WINDOW_CLASS] or windows
         if eligible:
             best = max(eligible, key=lambda w: w["area"])
             Log.info(f"окно браузера найдено: hwnd={best['hwnd']} class={best['class']}")
@@ -2054,12 +2365,32 @@ def find_browser_window(pids: set[int], timeout: float = 30.0) -> int:
     return 0
 
 
-def embed_window(hwnd: int, parent: int, inset: tuple[int, int, int, int], cover: int = 0) -> bool:
-    """Сделать окно браузера ДОЧЕРНИМ окном плейсхолдера Qt.
+def is_child_of(child: int, parent: int) -> bool:
+    """Действительно ли окно встроено в нужного родителя (проверка, не надежда)."""
+    if not user32 or not child or not parent:
+        return False
+    try:
+        return handle_value(user32.GetParent(hwnd_of(child))) == int(parent)
+    except Exception:
+        return False
 
-    При любой ошибке — полный откат: полувстроенное окно хуже обычного.
-    Порядок важен: поставить на место → поднять шторку → показать окно →
-    поднять шторку снова. Иначе браузер на мгновение виден поверх шторки.
+
+def embed_window(hwnd: int, parent: int, inset: tuple[int, int, int, int],
+                 cover: int = 0, timeout: float = 4.0) -> bool:
+    """Сделать окно браузера ДОЧЕРНИМ окном плейсхолдера.
+
+    Что здесь важно и чего раньше НЕ было (из-за этого браузер оставался
+    отдельным окном со своими кнопками свернуть/закрыть):
+
+    1. `GetParent` проверяется ПОСЛЕ `SetParent`. Chromium на `--app=` создаёт
+       окно позже собственной инициализации; если `SetParent` пришёл слишком
+       рано, он молча ничего не делает. Поэтому попытка повторяется, пока не
+       выйдет время, — а не «один раз и как получится».
+    2. Стиль ставится ДО `SetParent` и проверяется ПОСЛЕ: без `WS_CHILD`
+       окно с `WS_POPUP` остаётся самостоятельным окном поверх родителя.
+    3. Порядок «поставить на место → поднять шторку → показать → поднять
+       шторку снова»: иначе браузер на мгновение виден поверх шторки.
+    4. При любой ошибке — полный откат: полувстроенное окно хуже обычного.
     """
     if not user32 or not hwnd or not parent:
         return False
@@ -2070,40 +2401,79 @@ def embed_window(hwnd: int, parent: int, inset: tuple[int, int, int, int], cover
                         (style & ~(WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME |
                                    WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_DLGFRAME | WS_BORDER))
                         | WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS)
-        _clear_error()
-        user32.SetParent(hwnd_of(hwnd), hwnd_of(parent))
-        error = _last_error()
-        if int(user32.GetParent(hwnd_of(hwnd)) or 0) != int(parent):
-            raise OSError(error or -1, "SetParent не прикрепил окно браузера")
         set_window_long(hwnd, GWL_EXSTYLE,
                         (exstyle & ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE |
                                      WS_EX_CLIENTEDGE | WS_EX_STATICEDGE |
                                      WS_EX_APPWINDOW | WS_EX_NOACTIVATE))
                         | WS_EX_TOOLWINDOW)
+        # `--app` окна Chromium иногда создаются уже ПОСЛЕ того, как мы их
+        # нашли: SetParent по такому окну просто не срабатывает. Повторяем.
+        deadline = time.monotonic() + max(0.5, timeout)
+        attempt = 0
+        while True:
+            attempt += 1
+            _clear_error()
+            try:
+                user32.SetParent(hwnd_of(hwnd), hwnd_of(parent))
+            except Exception:
+                Log.exc("win.embed_setparent")
+            error = _last_error()
+            if is_child_of(hwnd, parent):
+                Log.info(f"окно браузера встроено: hwnd={hwnd} parent={parent} "
+                         f"попыток={attempt}")
+                break
+            if time.monotonic() >= deadline:
+                raise OSError(error or -1, "SetParent не прикрепил окно браузера")
+            time.sleep(0.12)
         sync_window(hwnd, parent, inset)
         if cover:
-            force_topmost(cover)
+            raise_window(cover)
         user32.ShowWindow(hwnd_of(hwnd), SW_SHOW)
         if cover:
-            force_topmost(cover)
-        Log.info(f"окно браузера встроено: hwnd={hwnd} parent={parent} inset={inset}")
+            raise_window(cover)
+        # После показа Chromium может вернуть себе часть стиля — проверяем.
+        current = get_window_long(hwnd, GWL_STYLE)
+        if not current & WS_CHILD:
+            Log.warn("окно браузера потеряло WS_CHILD — ставлю стиль заново")
+            set_window_long(hwnd, GWL_STYLE,
+                            (current & ~(WS_POPUP | WS_CAPTION | WS_SYSMENU |
+                                         WS_THICKFRAME | WS_MINIMIZEBOX |
+                                         WS_MAXIMIZEBOX | WS_DLGFRAME | WS_BORDER))
+                            | WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS)
+            sync_window(hwnd, parent, inset)
         return True
     except Exception:
         Log.exc("win.embed")
-        try:
-            user32.SetParent(hwnd_of(hwnd), None)
-            set_window_long(hwnd, GWL_STYLE, style)
-            set_window_long(hwnd, GWL_EXSTYLE, exstyle)
-            user32.ShowWindow(hwnd_of(hwnd), SW_SHOW)
-        except Exception:
-            Log.exc("win.embed_rollback")
+        detach_window(hwnd, style, exstyle)
         return False
+
+
+def detach_window(hwnd: int, style: int = 0, exstyle: int = 0) -> None:
+    """Отпустить окно браузера обратно в самостоятельные окна (откат)."""
+    if not user32 or not hwnd:
+        return
+    try:
+        user32.SetParent(hwnd_of(hwnd), None)
+        if style:
+            set_window_long(hwnd, GWL_STYLE, style)
+        if exstyle:
+            set_window_long(hwnd, GWL_EXSTYLE, exstyle)
+        user32.ShowWindow(hwnd_of(hwnd), SW_SHOW)
+    except Exception:
+        Log.exc("win.detach")
 
 
 def sync_window(hwnd: int, parent: int, inset: tuple[int, int, int, int],
                 show: bool = True) -> bool:
-    """Держать окно браузера ровно над плейсхолдером (в его клиентских px)."""
+    """Держать окно браузера ровно над плейсхолдером (в его клиентских px).
+
+    Если окно перестало быть дочерним (Chromium пересоздал его после
+    перезагрузки страницы), возвращается False — хост по этому признаку
+    вживляет окно заново, а не «двигает» чужое окно по экрану.
+    """
     if not user32 or not hwnd or not parent:
+        return False
+    if not is_child_of(hwnd, parent):
         return False
     width, height = client_size(parent)
     if width <= 0 or height <= 0:
@@ -2132,22 +2502,151 @@ def hide_window(hwnd: int) -> None:
             pass
 
 
-def hide_stray_windows(pids: set[int], keep: int = 0) -> None:
-    """Скрыть и закрыть все окна браузера, кроме встроенного.
+WM_CLOSE = 0x0010
+#: GWL-индексы и флаг «окно — самостоятельный корень». Нужны, чтобы отличить
+#: настоящее лишнее окно Chromium от его же служебного окна.
+GW_OWNER = 4
+GA_ROOTOWNER = 3
 
-    Chromium поднимает служебные окна уже после старта — без этого они висят
-    в Alt+Tab и «сырой» браузер виден пользователю.
+
+def hide_stray_windows(pids: set[int], keep: int = 0) -> list[int]:
+    """Скрыть лишние окна браузера; закрыть — только настоящие лишние.
+
+    Chromium поднимает служебные окна уже после старта: без этого они висят в
+    Alt+Tab, а иногда и поверх программы. Два правила, оба важные:
+
+    * Встроенное окно (`keep`) не трогаем никогда.
+    * Закрывать `WM_CLOSE` можно ТОЛЬКО окно класса `Chrome_WidgetWin_1`.
+      Служебные окна (`Chrome_WidgetWin_0`) — это опорное окно браузера:
+      его закрытие убивает весь процесс вместе со страницей.
     """
     if not user32:
-        return
+        return []
+    hidden: list[int] = []
     for window in _windows_of(set(pids) | process_tree(pids)):
-        if int(window["hwnd"]) == int(keep or 0):
+        hwnd = int(window.get("hwnd") or 0)
+        if not hwnd or hwnd == int(keep or 0) or not window.get("visible"):
+            continue
+        if keep and is_child_of(hwnd, keep):
+            # Дочернее окно ВСТРОЕННОГО окна — это его же поверхность.
+            continue
+        # Настоящее лишнее окно: либо без родителя, либо самостоятельный
+        # корень своего окна-владельца. Служебные окна Chromium вложены в
+        # основное — их не трогаем вовсе (иначе Chromium умирает).
+        if window.get("parent") and not window.get("self_root"):
             continue
         try:
-            hide_window(window["hwnd"])
-            user32.PostMessageW(hwnd_of(window["hwnd"]), 0x0010, 0, 0)  # WM_CLOSE
+            user32.ShowWindow(hwnd_of(hwnd), SW_HIDE)
+            hide_from_taskbar(hwnd)
+            hidden.append(hwnd)
+            if window.get("class") == BROWSER_WINDOW_CLASS:
+                user32.PostMessageW(hwnd_of(hwnd), WM_CLOSE, 0, 0)
         except Exception:
-            continue
+            Log.exc("win.hide_stray")
+    if hidden:
+        Log.info(f"скрыто лишних окон браузера: {len(hidden)}")
+    return hidden
+
+
+# ---------------------------------------------------------------------------
+# ФОКУС КЛАВИАТУРЫ. Окно браузера — ДРУГОЙ процесс со своей очередью ввода:
+# клик внутри него не передаёт ему клавиатуру. Без этого «при выделении чата
+# ничего не пишется» — буквально: клавиши уходят в окно программы.
+#
+# Ограничения (сознательные, как в исходной версии): перехвата клавиш нет,
+# текст не читается, ничего не печатается за пользователя. Читается только
+# состояние ЛЕВОЙ КНОПКИ МЫШИ и хэндл окна под курсором; очереди ввода
+# соединяются ровно на время одного `SetFocus`.
+# ---------------------------------------------------------------------------
+
+def belongs_to(root: int, hwnd: int) -> bool:
+    """Окно `hwnd` — это `root` или его потомок."""
+    if not user32 or not root or not hwnd:
+        return False
+    try:
+        return handle_value(root) == handle_value(hwnd) or \
+            bool(user32.IsChild(hwnd_of(root), hwnd_of(hwnd)))
+    except Exception:
+        return False
+
+
+def thread_focus(tid: int) -> dict:
+    info = GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(info)
+    try:
+        if not user32.GetGUIThreadInfo(int(tid), ctypes.byref(info)):
+            return {}
+    except Exception:
+        return {}
+    return {"active": handle_value(info.hwndActive),
+            "focus": handle_value(info.hwndFocus)}
+
+
+def handoff_focus(host: int, browser: int, target: int) -> bool:
+    """Отдать клавиатурный фокус окну внутри НАШЕГО встроенного браузера.
+
+    Только если наше окно (или сам браузер) — активное окно системы, и только
+    если цель действительно принадлежит нашему браузеру. Чужое окно не
+    трогаем никогда.
+    """
+    if not user32 or not kernel32:
+        return False
+    try:
+        foreground = handle_value(user32.GetForegroundWindow())
+        if not (belongs_to(host, foreground) or belongs_to(browser, foreground)):
+            return False
+        if not belongs_to(browser, target):
+            return False
+        current_tid = int(kernel32.GetCurrentThreadId())
+        target_tid = int(user32.GetWindowThreadProcessId(hwnd_of(target), None) or 0)
+        if not target_tid:
+            return False
+        if thread_focus(target_tid).get("focus") == handle_value(target):
+            return True
+        attached = False
+        try:
+            if target_tid != current_tid:
+                _clear_error()
+                attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
+                if not attached:
+                    return False
+            user32.SetFocus(hwnd_of(target))
+            return belongs_to(browser, thread_focus(target_tid).get("focus", 0))
+        finally:
+            if attached:
+                try:
+                    user32.AttachThreadInput(current_tid, target_tid, False)
+                except Exception:
+                    pass
+    except Exception:
+        Log.exc("win.handoff_focus")
+        return False
+
+
+class FocusBridge:
+    """Отдаёт фокус в чат по клику мышью внутри встроенного браузера."""
+
+    def __init__(self) -> None:
+        self.host = 0
+        self.browser = 0
+
+    def poll(self, host: int, browser: int, enabled: bool) -> None:
+        if not user32 or not browser or not enabled:
+            return
+        self.host, self.browser = int(host or 0), int(browser or 0)
+        try:
+            down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+            if not down:
+                return
+            point = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                return
+            target = handle_value(user32.WindowFromPoint(point))
+            if not target or not belongs_to(self.browser, target):
+                return
+            handoff_focus(self.host, self.browser, target)
+        except Exception:
+            Log.exc("win.focus_poll")
 
 
 # =============================================================================
@@ -3062,6 +3561,46 @@ class _Launcher(QThread):
             return
         self.process = process
 
+    #: Сколько ждать, пока ссылка `--app=` откроется как настоящая страница.
+    #: Сразу после старта Chromium показывает служебное окно-«заглушку»
+    #: (`Chrome_WidgetWin_0`, около 500x300) — если вживить ЕГО, программа
+    #: получит пустое окно, а настоящая страница останется отдельным окном
+    #: со своими кнопками свернуть/закрыть. Именно это и было видно.
+    PAGE_TIMEOUT = 20.0
+
+    def _wait_for_page(self, process: BrowserProcess) -> bool:
+        """Дождаться, пока `--app=` станет настоящей страницей с целью DevTools."""
+        deadline = time.monotonic() + self.PAGE_TIMEOUT
+        while time.monotonic() < deadline and not self._stop:
+            kind, _version, targets = process.probe()
+            if kind == "exited":
+                return False
+            if kind == "ready" and choose_target(targets or []) is not None:
+                return True
+            time.sleep(0.2)
+        Log.warn("страница чата не открылась — вживляю окно как есть")
+        return True
+
+    def _find_page_window(self, process: BrowserProcess, timeout: float = 12.0) -> int:
+        """Настоящее окно страницы: класс `Chrome_WidgetWin_1`, размером с окно.
+
+        `Chrome_WidgetWin_0` — служебное окно браузера: вживлять его нельзя,
+        оно не содержит страницы.
+        """
+        deadline = time.monotonic() + max(0.5, timeout)
+        while time.monotonic() < deadline and not self._stop:
+            found = _windows_of({process.pid()} | process_tree({process.pid()}))
+            for window in found:
+                if not window["visible"] or window["parent"]:
+                    continue
+                if window["class"] != BROWSER_WINDOW_CLASS:
+                    continue
+                left, top, right, bottom = window["rect"]
+                if (right - left) >= 300 and (bottom - top) >= 300:
+                    return int(window["hwnd"])
+            time.sleep(0.2)
+        return 0
+
     def _supervise(self) -> None:
         process = self.process
         if process is None:
@@ -3069,6 +3608,7 @@ class _Launcher(QThread):
         deadline = time.monotonic() + 45
         window_sent = False
         devtools_sent = False
+        page_seen = False
         while time.monotonic() < deadline and not self._stop:
             kind, _version, _targets = process.probe()
             if kind == "exited":
@@ -3078,8 +3618,14 @@ class _Launcher(QThread):
                 devtools_sent = True
                 self.devtools_ok = True
                 self.devtools_found.emit(process.port)
-            if not window_sent:
-                found = find_browser_window({process.pid()}, timeout=0.1)
+            if kind == "ready" and not page_seen:
+                # Страница уже есть — можно искать её окно.
+                page_seen = self._wait_for_page(process)
+            if not window_sent and page_seen:
+                found = self._find_page_window(process)
+                if not found:
+                    # Запасной вариант: любое большое окно Chromium.
+                    found = find_browser_window({process.pid()}, timeout=0.1)
                 if found:
                     window_sent = True
                     self.hwnd = found
@@ -3131,6 +3677,8 @@ class BrowserHost(QObject):
         self._announced = False
         self._stopping = False
         self._tick = 0
+        self._embed_failures = 0
+        self.focus = FocusBridge()
         # Один таймер на всё: держать окно на месте и убирать лишние окна.
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_timer)
@@ -3140,7 +3688,7 @@ class BrowserHost(QObject):
         self.placeholder = placeholder
         try:
             placeholder.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-            self.cover = int(placeholder.window().winId() or 0)
+            self.cover = handle_value(placeholder.window().winId())
         except Exception:
             self.cover = 0
         candidates = discover_browsers(ROOT_DIR, self.configured or None)
@@ -3163,7 +3711,7 @@ class BrowserHost(QObject):
         if self._stopping or not self.placeholder:
             return
         try:
-            parent = int(self.placeholder.winId())
+            parent = handle_value(self.placeholder.winId())
         except Exception:
             Log.exc("host.placeholder_hwnd")
             return
@@ -3177,7 +3725,8 @@ class BrowserHost(QObject):
         if not embed_window(self.hwnd, parent, self.inset, self.cover):
             self.failed.emit("embed-failed")
             return
-        apply_taskbar_style(self.hwnd)
+        self._embed_failures = 0
+        hide_from_taskbar(self.hwnd)
         self._maybe_ready()
 
     def _on_devtools(self, port: int) -> None:
@@ -3207,20 +3756,52 @@ class BrowserHost(QObject):
 
     # ------------------------------------------------------------------ upkeep
     def _on_timer(self) -> None:
-        if self._stopping or not self.hwnd:
+        """Держать окно на месте и присматривать за ним.
+
+        Три задачи, и все три — из-за того, что браузер живёт отдельно:
+        * пересчитать положение (окно переехало, изменился масштаб, размер);
+        * заметить ОТРЫВ окна (Chromium пересоздал его) и вживить заново —
+          иначе браузер снова становится отдельным окном со своими кнопками;
+        * убрать из панели задач и закрыть лишние окна Chromium.
+        """
+        if self._stopping or not self.hwnd or not self.placeholder:
             return
         self._tick += 1
         try:
-            self.inset = tuple(int(v) for v in self.inset_provider())
-            sync_window(self.hwnd, int(self.placeholder.winId()), self.inset)
+            parent = handle_value(self.placeholder.winId())
         except Exception:
-            Log.exc("host.sync")
-        if self._tick % 6 == 0:          # раз в ~5 секунд
+            Log.exc("host.placeholder_hwnd")
+            return
+        self.inset = tuple(int(v) for v in self.inset_provider())
+        if not is_child_of(self.hwnd, parent):
+            self._embed_failures += 1
+            Log.warn(f"окно браузера выпало из встраивания (попытка "
+                     f"{self._embed_failures}) — вживляю заново")
+            if not embed_window(self.hwnd, parent, self.inset, self.cover):
+                if self._embed_failures >= 5:
+                    self.failed.emit("embed-lost")
+                return
+        else:
+            sync_window(self.hwnd, parent, self.inset)
+            # Шторку поднимаем ПОВЕРХ браузера, пока страница не готова.
+            if self.cover and not self._announced:
+                raise_window(self.cover)
+        if self._tick % 5 == 0:          # раз в ~4 секунды
             try:
+                hide_from_taskbar(self.hwnd)
                 self.refresh_pids()
                 hide_stray_windows(self.pids, keep=self.hwnd)
             except Exception:
                 Log.exc("host.strays")
+
+    def poll_focus(self, host_hwnd: int, enabled: bool) -> None:
+        """Отдать клавиатуру в чат по клику внутри окна браузера."""
+        if self._stopping or not self.hwnd:
+            return
+        try:
+            self.focus.poll(host_hwnd, self.hwnd, bool(enabled))
+        except Exception:
+            Log.exc("host.focus")
 
     def sync(self) -> None:
         """Сразу пересчитать сдвиг и поставить окно на место."""
@@ -3228,7 +3809,7 @@ class BrowserHost(QObject):
             return
         try:
             self.inset = tuple(int(v) for v in self.inset_provider())
-            sync_window(self.hwnd, int(self.placeholder.winId()), self.inset)
+            sync_window(self.hwnd, handle_value(self.placeholder.winId()), self.inset)
         except Exception:
             Log.exc("host.sync_now")
 
@@ -3241,16 +3822,21 @@ class BrowserHost(QObject):
             Log.exc("host.refresh_pids")
 
     def stop(self) -> None:
+        """Погасить браузер ЦЕЛИКОМ (с деревом процессов) и отпустить окно."""
         self._stopping = True
         self.timer.stop()
         if self.launcher is not None:
             self.launcher.stop()
         if self.launcher is not None and self.launcher.process is not None:
             try:
+                # close() снимает всё дерево процессов (см. kill_tree):
+                # `terminate()` убил бы только родителя, а окна рендереров
+                # остались бы висеть — из-за этого «плодятся браузеры».
                 self.launcher.process.close()
             except Exception:
                 Log.exc("host.stop")
         if self.hwnd:
+            detach_window(self.hwnd)
             hide_window(self.hwnd)
 
 
@@ -3293,7 +3879,7 @@ class DraggableDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         try:
-            apply_win32_icon(int(self.winId()))
+            apply_win32_icon(handle_value(self.winId()))
         except Exception:
             pass
 
@@ -3750,7 +4336,7 @@ class LoadingOverlay(QWidget):
             self.show()
         if not self._anim.isActive():
             self._anim.start()
-        force_topmost(int(self.winId()))
+        force_topmost(handle_value(self.winId()))
         self.update()
 
     def set_message(self, message: str) -> None:
@@ -3762,15 +4348,30 @@ class LoadingOverlay(QWidget):
         self.hide()
 
     def sync_geometry(self) -> None:
+        """Поставить шторку ровно над областью чата внутри окна программы.
+
+        Шторка — отдельное окно верхнего уровня (у неё нет родителя: иначе она
+        не поднимется над встроенным браузером). Значит её положение НЕ
+        меняется само — его надо пересчитывать каждый раз, когда тронулось
+        главное окно. Именно поэтому шторка раньше «оставалась слева».
+        """
         try:
             owner = self._owner
             if not owner:
                 return
-            geometry = owner.geometry()
-            top = getattr(owner, "top_inset", 54)
-            bottom = getattr(owner, "bottom_inset", 30)
-            self.setGeometry(geometry.x(), geometry.y() + top, geometry.width(),
-                             geometry.height() - top - bottom)
+            geometry = owner.frameGeometry()
+            top = int(getattr(owner, "top_inset", 54))
+            bottom = int(getattr(owner, "bottom_inset", 30))
+            # Запас по рамке: у окна без рамки он нулевой, но на другой
+            # версии Windows рамка может появиться после смены стиля.
+            left = geometry.x()
+            upper = geometry.y() + top
+            width = max(120, geometry.width())
+            height = max(120, geometry.height() - top - bottom)
+            current = self.geometry()
+            if (current.x(), current.y(), current.width(), current.height()) != \
+                    (left, upper, width, height):
+                self.setGeometry(left, upper, width, height)
         except Exception:
             Log.exc("ui.overlay_geometry")
 
@@ -3916,7 +4517,6 @@ class MainWindow(QMainWindow):
 
         self.top_inset = self.TOP_INSET
         self.bottom_inset = self.BOTTOM_INSET
-        self.side_inset = 0
 
         self.host: BrowserHost | None = None
         self.controller: PageController | None = None
@@ -3975,7 +4575,22 @@ class MainWindow(QMainWindow):
 
         self.topmost_timer = QTimer(self)
         self.topmost_timer.timeout.connect(self._enforce_topmost)
-        self.topmost_timer.start(1500)
+        self.topmost_timer.start(1200)
+
+        # Окно браузера — другой процесс со своей очередью ввода: без этого
+        # таймера клик по чату не отдаёт ему клавиатуру и «ничего не пишется».
+        self.focus_timer = QTimer(self)
+        self.focus_timer.timeout.connect(self._poll_browser_focus)
+        self.focus_timer.start(25)
+        self._last_dpr = 0.0
+
+        # Смена масштаба/монитора: пересчитать сдвиг и раскладку сразу.
+        try:
+            window_handle = self.windowHandle()
+            if window_handle is not None:
+                window_handle.screenChanged.connect(lambda _s: self._on_screen_changed())
+        except Exception:
+            Log.exc("ui.screen_hook")
 
         QTimer.singleShot(120, self._start_browser)
         QTimer.singleShot(600, self._prepare_attachments_if_possible)
@@ -4108,8 +4723,34 @@ class MainWindow(QMainWindow):
         self.bottom_bar.setGeometry(0, height - self.bottom_inset, width, self.bottom_inset)
         self.browser_placeholder.setGeometry(0, self.top_inset, width,
                                              height - self.top_inset - self.bottom_inset)
+        # Окно браузера встаёт по КЛИЕНТСКОЙ части плейсхолдера, а она равна
+        # ему только пока окно программы не имеет рамки. Если Windows всё же
+        # добавила рамку, браузер вылезал бы за область чата — поэтому размер
+        # запоминается здесь и используется при вживлении.
         self.top_bar.raise_()
         self.bottom_bar.raise_()
+
+    def moveEvent(self, event):
+        """Окно переехало — шторка ожидания обязана переехать с ним.
+
+        Это отдельное окно верхнего уровня (у него нет родителя, иначе оно не
+        поднимется над встроенным браузером). Пока `moveEvent` не было, шторка
+        оставалась на старом месте: сдвинули программу — «Ожидание» осталось
+        висеть слева от неё.
+        """
+        super().moveEvent(event)
+        position = (self.x(), self.y())
+        if (_WINDOW_POSITION.get("x"), _WINDOW_POSITION.get("y")) != position:
+            _WINDOW_POSITION["x"], _WINDOW_POSITION["y"] = position
+            Log.info(f"окно перемещено: {position[0]},{position[1]}; "
+                     f"масштаб={self.devicePixelRatioF():.2f}")
+        try:
+            if self.overlay.isVisible():
+                self.overlay.sync_geometry()
+                force_topmost(handle_value(self.overlay.winId()))
+        except Exception:
+            Log.exc("ui.move_event")
+        self.sync_browser()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -4118,7 +4759,9 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self._layout_children()
-        QTimer.singleShot(0, lambda: apply_win32_icon(int(self.winId())))
+        QTimer.singleShot(0, lambda: apply_win32_icon(handle_value(self.winId())))
+        QTimer.singleShot(0, self._place_overlay)
+        QTimer.singleShot(150, self._log_metrics_once)
 
     # ----------------------------------------------------------- window drag
     def mousePressEvent(self, event):
@@ -4164,19 +4807,74 @@ class MainWindow(QMainWindow):
         self.files_label.setText("файлы: " + " + ".join(names))
 
     def _show_overlay(self, title: str, message: str, error: bool = False) -> None:
+        """Показать шторку и СРАЗУ поставить её над областью чата.
+
+        `show_state` синхронизирует геометрию до `show()`, но у окна верхнего
+        уровня первая отрисовка может прийти с задержкой — поэтому позиция
+        выставляется повторно, уже после показа.
+        """
         if self._closing:
             return
         self.overlay.show_state(title, message, error)
+        self._place_overlay()
 
     def _hide_overlay(self) -> None:
         self.overlay.finish()
 
     def _enforce_topmost(self) -> None:
-        if not self._closing and self.isVisible():
-            try:
-                force_topmost(int(self.winId()))
-            except Exception:
-                pass
+        """Держать окно программы (и шторку) поверх остальных окон.
+
+        Окно без рамки легко «проваливается» под чужие окна. Заодно здесь же
+        выравнивается шторка: размер/позиция окна могли измениться без
+        событий Qt (переезд на монитор с другим масштабом).
+        """
+        if self._closing or not self.isVisible():
+            return
+        try:
+            force_topmost(handle_value(self.winId()))
+        except Exception:
+            Log.exc("ui.topmost")
+        try:
+            if self.overlay.isVisible():
+                self.overlay.sync_geometry()
+                force_topmost(handle_value(self.overlay.winId()))
+        except Exception:
+            Log.exc("ui.topmost_overlay")
+
+    def _poll_browser_focus(self) -> None:
+        """Отдать клавиатуру в чат, если пользователь щёлкнул внутри него."""
+        if self._closing or self.host is None:
+            return
+        try:
+            self.host.poll_focus(handle_value(self.winId()), self.isActiveWindow())
+        except Exception:
+            Log.exc("ui.focus_timer")
+
+    def _place_overlay(self) -> None:
+        """Поставить шторку ровно над областью чата (после показа окна)."""
+        try:
+            if self.overlay.isVisible():
+                self.overlay.sync_geometry()
+                force_topmost(handle_value(self.overlay.winId()))
+        except Exception:
+            Log.exc("ui.place_overlay")
+
+    def _on_screen_changed(self) -> None:
+        """Монитор или масштаб сменились: пересчитать всё, не перезапуская браузер."""
+        if self._closing:
+            return
+        try:
+            ratio = float(self.devicePixelRatioF()) or 1.0
+        except Exception:
+            ratio = 1.0
+        if abs(ratio - float(getattr(self, "_last_dpr", 0.0) or 0.0)) < 0.001:
+            return
+        self._last_dpr = ratio
+        Log.info(f"масштаб экрана: {ratio}")
+        self._layout_children()
+        self.sync_browser()
+        self._place_overlay()
+        self._refresh_layout()
 
     def sync_browser(self) -> None:
         if self.host is not None:
@@ -4210,11 +4908,23 @@ class MainWindow(QMainWindow):
                 return width, height
         return int(W), int(H - self.top_inset - self.bottom_inset)
 
+    def _log_metrics_once(self) -> None:
+        """Один раз записать в журнал размеры — по ним видно, где «уехало»."""
+        try:
+            logical = self._placeholder_logical_size()
+            physical = self._placeholder_physical_size()
+            Log.info(f"область чата: {logical[0]}x{logical[1]} DIP, "
+                     f"{physical[0]}x{physical[1]} px, "
+                     f"масштаб={self.devicePixelRatioF():.2f}, "
+                     f"сдвиг браузера={self._browser_inset()}")
+        except Exception:
+            Log.exc("ui.log_metrics")
+
     def _placeholder_physical_size(self) -> tuple[int, int]:
         placeholder = getattr(self, "browser_placeholder", None)
         if placeholder is not None and user32:
             try:
-                width, height = client_size(int(placeholder.winId()))
+                width, height = client_size(handle_value(placeholder.winId()))
                 if width > 0 and height > 0:
                     return int(width), int(height)
             except Exception:
@@ -4276,6 +4986,16 @@ class MainWindow(QMainWindow):
             return
         Log.error(f"браузер не запустился: {reason}")
         self._set_status("Браузер не запущен", THEME["danger"])
+        if reason in ("embed-failed", "embed-lost"):
+            # Окно браузера не прикрепилось: оставить его висеть отдельным
+            # окном хуже, чем начать заново — иначе оно перекроет программу.
+            self._stop_browser()
+            self._show_overlay(
+                "Браузер не встроился",
+                "Закрываю и открываю окно заново…",
+                error=True)
+            QTimer.singleShot(700, self._restart_browser)
+            return
         if reason in ("no-browser", "attempts-exhausted"):
             self._show_overlay(
                 "Нужен Google Chrome",
@@ -4503,7 +5223,7 @@ class MainWindow(QMainWindow):
         else:
             self.show()
             self.activateWindow()
-            force_topmost(int(self.winId()))
+            force_topmost(handle_value(self.winId()))
             if self.host is not None:
                 self.host.sync()
             if self.controller is not None and self._chat_ready:
@@ -4599,7 +5319,7 @@ class MainWindow(QMainWindow):
         mic_key = normalize_key(self.cfg.get("hotkey_mic"))
         self.hotkeys.set_keys(VK_MAP.get(toggle_key, 0), VK_MAP.get(mic_key, 0))
         try:
-            self.hotkeys.try_suppress(int(self.winId() or 0))
+            self.hotkeys.try_suppress(handle_value(self.winId()))
         except Exception:
             Log.exc("hotkey.suppress")
         Log.info(f"горячие клавиши: микрофон={mic_key or '—'} окно={toggle_key or '—'}")
@@ -4668,6 +5388,7 @@ class MainWindow(QMainWindow):
         try:
             self._hotkey_timer.stop()
             self.topmost_timer.stop()
+            self.focus_timer.stop()
         except Exception:
             pass
         try:
@@ -4688,10 +5409,12 @@ class MainWindow(QMainWindow):
         try:
             if event.type() == QEvent.Type.WindowStateChange:
                 if self.isMinimized():
+                    # Свёрнутое окно не должно оставлять шторку висеть на
+                    # экране: она — отдельное окно верхнего уровня.
                     self.overlay.hide()
                 elif self.overlay._anim.isActive() and not self._attached:
                     self.overlay.show()
-                    self.overlay.sync_geometry()
+                    self._place_overlay()
         except Exception:
             Log.exc("ui.change_event")
 
@@ -4736,8 +5459,7 @@ def check_dependencies() -> bool:
     import importlib.util
 
     missing = [name for module, name in (("PyQt6", "PyQt6"),
-                                         ("websocket", "websocket-client"),
-                                         ("fpdf", "fpdf2"))
+                                         ("websocket", "websocket-client"))
                if importlib.util.find_spec(module) is None]
     if missing:
         message = ("Не установлены зависимости: " + ", ".join(missing) + "\n\n"
@@ -4751,10 +5473,34 @@ def check_dependencies() -> bool:
     return True
 
 
+def check_pdf_support() -> bool:
+    """fpdf2 нужен ТОЛЬКО для промтов .txt/.md/.json — без него программа жива.
+
+    Серверная версия требовала его на старте и не запускалась вовсе; здесь
+    достаточно предупредить: промты в PDF работают без конвертации.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("fpdf") is not None:
+        return True
+    message = ("Пакет fpdf2 не установлен.\n\n"
+               "Промты в формате .pdf это не затрагивает. Но промты .txt, .md и "
+               ".json преобразуются в PDF через fpdf2 и работать не будут.\n\n"
+               "Установить:  pip install fpdf2")
+    Log.warn("fpdf2 не установлен — текстовые промты недоступны")
+    try:
+        # Один раз, на старте: без консоли это единственный способ увидеть.
+        ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x40)
+    except Exception:
+        print(message)
+    return False
+
+
 def main() -> int:
     suppress_console()
     if not check_dependencies():
         return 1
+    check_pdf_support()
     ensure_dirs()
     copy_bundled_font()
     Log.info(f"=== {APP_NAME} {APP_VERSION} ===")
@@ -4805,7 +5551,7 @@ def main() -> int:
     window.show()
     window.raise_()
     window.activateWindow()
-    force_topmost(int(window.winId()))
+    force_topmost(handle_value(window.winId()))
 
     exit_code = app.exec()
     try:

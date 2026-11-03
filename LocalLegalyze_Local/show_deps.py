@@ -25,8 +25,10 @@ PACKAGES = (
      "окно программы, поля, кнопки"),
     ("websocket-client", "websocket", ("websocket-client", "websocket"),
      "управление страницей чата через DevTools"),
+    # НЕ блокирует запуск: без него программа работает, но промты
+    # .txt/.md/.json не превращаются в PDF (только .pdf).
     ("fpdf2", "fpdf", ("fpdf2", "pyfpdf2", "fpdf"),
-     "промты .txt/.md/.json -> PDF (со шрифтом data/DejaVuSans.ttf)"),
+     "необязательно: промты .txt/.md -> PDF (шрифт data/DejaVuSans.ttf)"),
 )
 
 OPTIONAL = (
